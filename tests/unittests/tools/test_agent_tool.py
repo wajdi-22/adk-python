@@ -16,6 +16,8 @@ from google.adk.agents import Agent
 from google.adk.agents import SequentialAgent
 from google.adk.agents.callback_context import CallbackContext
 from google.adk.tools.agent_tool import AgentTool
+from google.adk.tools.tool_context import ToolContext
+from google.adk.events.event_actions import EventActions
 from google.genai.types import Part
 from pydantic import BaseModel
 from pytest import mark
@@ -209,3 +211,27 @@ def test_custom_schema():
   # The second request is the tool agent request.
   assert mock_model.requests[1].config.response_schema == CustomOutput
   assert mock_model.requests[1].config.response_mime_type == 'application/json'
+
+
+@mark.asyncio
+async def test_agent_tool_call_live():
+  mock_model = testing_utils.MockModel.create(['chunk1', 'chunk2'])
+
+  tool_agent = Agent(name='tool_agent', model=mock_model)
+  root_agent = Agent(name='root_agent', model=mock_model)
+
+  invocation_context = await testing_utils.create_invocation_context(root_agent)
+  tool_context = ToolContext(
+      invocation_context=invocation_context, event_actions=EventActions()
+  )
+
+  agent_tool = AgentTool(agent=tool_agent)
+  results = []
+  async for result in agent_tool._call_live(
+      args={'request': 'hi'},
+      tool_context=tool_context,
+      invocation_context=invocation_context,
+  ):
+    results.append(result)
+
+  assert results == ['chunk1']
