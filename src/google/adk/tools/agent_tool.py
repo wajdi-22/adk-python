@@ -22,6 +22,8 @@ from pydantic import model_validator
 from typing_extensions import override
 
 from . import _automatic_function_calling_util
+from ..agents.run_config import RunConfig
+from ..agents.run_config import StreamingMode
 from ..memory.in_memory_memory_service import InMemoryMemoryService
 from ..runners import Runner
 from ..sessions.in_memory_session_service import InMemorySessionService
@@ -125,7 +127,10 @@ class AgentTool(BaseTool):
 
     last_event = None
     async for event in runner.run_async(
-        user_id=session.user_id, session_id=session.id, new_message=content
+        user_id=session.user_id,
+        session_id=session.id,
+        new_message=content,
+        run_config=RunConfig(streaming_mode=StreamingMode.SSE),
     ):
       # Forward state delta to parent session.
       if event.actions.state_delta:
@@ -142,3 +147,58 @@ class AgentTool(BaseTool):
     else:
       tool_result = merged_text
     return tool_result
+
+  async def _call_live(
+      self,
+      *,
+      args: dict[str, Any],
+      tool_context: ToolContext,
+      invocation_context,
+  ):
+    """Streams results from the wrapped agent."""
+    from ..agents.llm_agent import LlmAgent
+
+    if self.skip_summarization:
+      tool_context.actions.skip_summarization = True
+
+    if isinstance(self.agent, LlmAgent) and self.agent.input_schema:
+      input_value = self.agent.input_schema.model_validate(args)
+      content = types.Content(
+          role='user',
+          parts=[
+              types.Part.from_text(
+                  text=input_value.model_dump_json(exclude_none=True)
+              )
+          ],
+      )
+    else:
+      content = types.Content(
+          role='user',
+          parts=[types.Part.from_text(text=args['request'])],
+      )
+
+    runner = Runner(
+        app_name=self.agent.name,
+        agent=self.agent,
+        artifact_service=ForwardingArtifactService(tool_context),
+        session_service=InMemorySessionService(),
+        memory_service=InMemoryMemoryService(),
+    )
+
+    session = await runner.session_service.create_session(
+        app_name=self.agent.name,
+        user_id='tmp_user',
+        state=tool_context.state.to_dict(),
+    )
+
+    async for event in runner.run_async(
+        user_id=session.user_id,
+        session_id=session.id,
+        new_message=content,
+        run_config=RunConfig(streaming_mode=StreamingMode.SSE),
+    ):
+      if event.actions.state_delta:
+        tool_context.state.update(event.actions.state_delta)
+      if not event.content or not event.content.parts:
+        continue
+      yield '\n'.join(p.text for p in event.content.parts if p.text)
